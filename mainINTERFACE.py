@@ -37,10 +37,10 @@ model.eval()
 SERVER_VIDEOS_DIR = "server_videos"
 os.makedirs(SERVER_VIDEOS_DIR, exist_ok=True)
 
-def load_video(video_path, max_frames_num,fps=1,force_sample=False):
+def load_video(video_path, max_frames_num, fps=1, force_sample=False):
     if max_frames_num == 0:
         return np.zeros((1, 336, 336, 3))
-    vr = VideoReader(video_path, ctx=cpu(0),num_threads=1)
+    vr = VideoReader(video_path, ctx=cpu(0), num_threads=1)
     total_frame_num = len(vr)
     video_time = total_frame_num / vr.get_avg_fps()
     fps = round(vr.get_avg_fps()/fps)
@@ -53,8 +53,7 @@ def load_video(video_path, max_frames_num,fps=1,force_sample=False):
         frame_time = [i/vr.get_avg_fps() for i in frame_idx]
     frame_time = ",".join([f"{i:.2f}s" for i in frame_time])
     spare_frames = vr.get_batch(frame_idx).asnumpy()
-    # import pdb;pdb.set_trace()
-    return spare_frames,frame_time,video_time
+    return spare_frames, frame_time, video_time
 
 def refresh_file_list():
     files = [f for f in os.listdir(SERVER_VIDEOS_DIR) if f.lower().endswith(".mp4")]
@@ -64,34 +63,26 @@ def refresh_file_list():
 def upload_video(user_file, custom_filename):
     if user_file is None:
         return "No file uploaded.", gr.Dropdown.update()
-
     _, ext = os.path.splitext(user_file.name)
     if ext.lower() != ".mp4":
         raise gr.Error("Only .mp4 files are allowed!")
-    
     try:
         if not custom_filename.strip():
             custom_filename = os.path.basename(user_file.name)
-
         if not custom_filename.lower().endswith(".mp4"):
             custom_filename += ".mp4"
-
         base, ext = os.path.splitext(custom_filename)
         counter = 1
         final_filename = custom_filename
         while os.path.exists(os.path.join(SERVER_VIDEOS_DIR, final_filename)):
             final_filename = f"{base}_{counter}{ext}"
             counter += 1
-
         target_path = os.path.join(SERVER_VIDEOS_DIR, final_filename)
         shutil.copyfile(user_file.name, target_path)
-
         msg = f"Uploaded as {final_filename} successfully!"
-        
         files = refresh_file_list()
         dropdown_update = gr.Dropdown.update(choices=files, value=final_filename)
         return msg, dropdown_update
-
     except Exception as e:
         return f"Error uploading file: {str(e)}", gr.Dropdown.update()
 
@@ -114,48 +105,42 @@ def show_video(selected_filename):
         return None
     return video_path
 
-def process_video(server_video_name, user_input, max_tokens, temperature, top_p, top_k):
+def process_video(server_video_name, user_input, max_tokens, temperature, top_p, top_k, chat_history):
     if not server_video_name:
         raise gr.Error("No video selected.")
-
     video_path = os.path.join(SERVER_VIDEOS_DIR, server_video_name)
     if not os.path.exists(video_path):
         raise gr.Error(f"File not found: {video_path}")
-
-    max_frames_num = 18
+    max_frames_num = 1
     video_frames, frame_time, video_time = load_video(video_path, max_frames_num, 1, force_sample=True)
-
     video_tensor = image_processor.preprocess(video_frames, return_tensors="pt")["pixel_values"]
     video_tensor = video_tensor.to(device, dtype=torch.bfloat16)
     video = [video_tensor]
-
     conv_template = "qwen_2"
-    time_instruciton = f"The video lasts for {video_time:.2f} seconds, and {len(video[0])} frames are uniformly sampled from it. These frames are located at {frame_time}.Please answer the following questions related to this video."
-
+    time_instruciton = f"The video lasts for {video_time:.2f} seconds, and {len(video[0])} frames are uniformly sampled from it. These frames are located at {frame_time}. Please answer the following questions related to this video."
     question = DEFAULT_IMAGE_TOKEN + f"\n{time_instruciton}\n{user_input}"
-
     conv = copy.deepcopy(conv_templates[conv_template])
     conv.append_message(conv.roles[0], question)
     conv.append_message(conv.roles[1], None)
     prompt_question = conv.get_prompt()
-
     input_ids = tokenizer_image_token(prompt_question, tokenizer, IMAGE_TOKEN_INDEX, return_tensors="pt")
     input_ids = input_ids.unsqueeze(0).to(device)
-
     with torch.inference_mode():
         cont = model.generate(
             input_ids,
             images=video,
             modalities=["video"],
-            do_sample=False,
+            do_sample=True,
             temperature=temperature,
             top_p=top_p,
             top_k=top_k,
             max_new_tokens=max_tokens,
         )
-
     text_outputs = tokenizer.batch_decode(cont, skip_special_tokens=True)[0].strip()
-    return text_outputs
+    new_pair = [f"<b>User:</b>\n {user_input}", f"<b>Assistant:</b>\n {text_outputs}"]
+
+    updated_history = chat_history + [new_pair]
+    return updated_history, updated_history
 
 def main():
     preset_questions = [
@@ -163,8 +148,41 @@ def main():
         "I want to know the name of the movie.",
         "What platform is this movie released on?"
     ]
-    with gr.Blocks() as demo:
+
+    custom_css = """
+    .message.user {
+        background-color: #0047e1 !important;
+        color: #ffffff !important;
+        border-radius: 12px !important;
+        padding: 8px 16px !important;
+        margin: 4px 20px 4px auto !important;
+        max-width: fit-content !important;
+        display: inline-block !important;
+        float: right !important;
+        clear: both !important;
+    }
+    
+    .message.bot {
+        background-color: #e1e1e1 !important;
+        color: #002d87 !important;
+        border-radius: 12px !important;
+        padding: 8px 16px !important;
+        margin: 4px auto 4px 20px !important;
+        max-width: fit-content !important;
+        display: inline-block !important;
+        float: left !important;
+        clear: both !important;
+    }
+    
+    .message-wrap {
+        display: flow-root !important;
+        margin-bottom: 8px !important;
+    }
+    """
+    
+    with gr.Blocks(css=custom_css) as demo:
         gr.Markdown("## LLaVA-NeXT Video Summarization (Qwen)")
+        chat_history = gr.State([])
 
         with gr.Row():
             with gr.Column():
@@ -172,35 +190,32 @@ def main():
                 uploader = gr.File(
                     label="Choose a video from your PC",
                     file_types=[".mp4"],
-                    type="file"
+                    type="file", scale=0
                 )
                 filename_input = gr.Textbox(
                     label="Enter filename (without extension)",
                     placeholder="Enter desired filename",
-                    interactive=True
+                    interactive=True, scale=0
                 )
-                upload_btn = gr.Button("Upload to Server")
-                upload_status = gr.Textbox(label="Upload Status")
-
+                upload_btn = gr.Button("Upload to Server", scale=0)
+                upload_status = gr.Textbox(label="Upload Status", scale=0)
                 uploader.change(
                     fn=update_filename,
                     inputs=[uploader],
                     outputs=[filename_input]
                 )
-
             with gr.Column():
                 gr.Markdown("### 2) Select a video from server_videos/")
                 video_list = gr.Dropdown(
                     label="Available videos",
                     choices=[],
-                    value=None
+                    value=None, scale=0
                 )
-                refresh_btn = gr.Button("Refresh File List")
+                refresh_btn = gr.Button("Refresh File List", scale=0)
                 video_player = gr.Video(
                     label="Preview",
-                    type="filepath"
+                    type="filepath", scale=0
                 )
-
                 refresh_btn.click(
                     fn=refresh_videos,
                     inputs=[],
@@ -216,99 +231,99 @@ def main():
                     inputs=[video_list],
                     outputs=[video_player]
                 )
-
-        gr.Markdown("### 3) Ask your question / Summarize")
-
-        user_prompt = gr.Dropdown(
-            choices=preset_questions,
-            allow_custom_value=True,
-            label="Enter your prompt or select from preset",
-            value=""
-        )
-        style_radio = gr.Radio(
-            choices=["Creative", "Balanced", "Strict", "Custom"],
-            label="Answer Style",
-            value="Balanced"
-        )
-        max_tokens_slider = gr.Slider(
-            minimum=1,
-            maximum=4096,
-            value=512,
-            step=1,
-            label="max_tokens"
-        )
-        temperature_slider = gr.Slider(
-            minimum=0.0,
-            maximum=1.99,
-            value=0.5,
-            step=0.01,
-            label="temperature"
-        )
-        top_p_slider = gr.Slider(
-            minimum=0,
-            maximum=1,
-            value=0.75,
-            step=0.01,
-            label="top_p"
-        )
-        top_k_slider = gr.Slider(
-            minimum=1,
-            maximum=100,
-            value=40,
-            step=1,
-            label="top_k"
-        )
-        def style_change(selected_style):
-            if selected_style == "Creative":
-                return (
-                    gr.update(value=1024),
-                    gr.update(value=1.5),
-                    gr.update(value=0.9),
-                    gr.update(value=40)
+            with gr.Column():
+                gr.Markdown("### 3) Ask your question / Summarize")
+                user_prompt = gr.Dropdown(
+                    choices=preset_questions,
+                    allow_custom_value=True,
+                    label="Enter your prompt or select from preset",
+                    value="", scale=0
                 )
-            elif selected_style == "Balanced":
-                return (
-                    gr.update(value=512),
-                    gr.update(value=0.5),
-                    gr.update(value=0.75),
-                    gr.update(value=40)
-                )
-            elif selected_style == "Strict":
-                return (
-                    gr.update(value=256),
-                    gr.update(value=0.2),
-                    gr.update(value=0.5),
-                    gr.update(value=30)
-                )
-            else:
-                return (
-                    gr.update(interactive=True),
-                    gr.update(interactive=True),
-                    gr.update(interactive=True),
-                    gr.update(interactive=True)
-                )
-
-        style_radio.change(
-            fn=style_change,
-            inputs=[style_radio],
-            outputs=[max_tokens_slider, temperature_slider, top_p_slider, top_k_slider]
-        )
-
-        submit_btn = gr.Button("Generate")
-        text_output = gr.Textbox(label="Model Output", lines=5)
-
+                with gr.Accordion("Advanced Configuration", open=False):
+                    style_radio = gr.Radio(
+                        choices=["Creative", "Balanced", "Strict", "Custom"],
+                        label="Answer Style",
+                        value="Balanced", scale=0
+                    )
+                    max_tokens_slider = gr.Slider(
+                        minimum=1,
+                        maximum=4096,
+                        value=512,
+                        step=1,
+                        label="max_tokens",
+                        interactive=False, scale=0
+                    )
+                    temperature_slider = gr.Slider(
+                        minimum=0.01,
+                        maximum=1.99,
+                        value=0.5,
+                        step=0.01,
+                        label="temperature",
+                        interactive=False, scale=0
+                    )
+                    top_p_slider = gr.Slider(
+                        minimum=0,
+                        maximum=1,
+                        value=0.75,
+                        step=0.01,
+                        label="top_p",
+                        interactive=False, scale=0
+                    )
+                    top_k_slider = gr.Slider(
+                        minimum=1,
+                        maximum=100,
+                        value=40,
+                        step=1,
+                        label="top_k",
+                        interactive=False, scale=0
+                    )
+                    def style_change(selected_style):
+                        if selected_style == "Creative":
+                            return (
+                                gr.update(value=1024, interactive=False),
+                                gr.update(value=1.5, interactive=False),
+                                gr.update(value=0.9, interactive=False),
+                                gr.update(value=40, interactive=False)
+                            )
+                        elif selected_style == "Balanced":
+                            return (
+                                gr.update(value=512, interactive=False),
+                                gr.update(value=0.5, interactive=False),
+                                gr.update(value=0.75, interactive=False),
+                                gr.update(value=40, interactive=False)
+                            )
+                        elif selected_style == "Strict":
+                            return (
+                                gr.update(value=256, interactive=False),
+                                gr.update(value=0.2, interactive=False),
+                                gr.update(value=0.5, interactive=False),
+                                gr.update(value=30, interactive=False)
+                            )
+                        else:
+                            return (
+                                gr.update(interactive=True),
+                                gr.update(interactive=True),
+                                gr.update(interactive=True),
+                                gr.update(interactive=True)
+                            )
+                    style_radio.change(
+                        fn=style_change,
+                        inputs=[style_radio],
+                        outputs=[max_tokens_slider, temperature_slider, top_p_slider, top_k_slider]
+                    )
+                submit_btn = gr.Button("Generate", scale=0)
+        gr.Markdown("### 4) Result")
+        chat_output = gr.Chatbot(label="Model Output",)
         submit_btn.click(
             fn=process_video,
-            inputs=[video_list, user_prompt, max_tokens_slider, temperature_slider, top_p_slider, top_k_slider],
-            outputs=[text_output]
+            inputs=[video_list, user_prompt, max_tokens_slider, temperature_slider, top_p_slider, top_k_slider, chat_history],
+            outputs=[chat_output, chat_history]
         )
-
         demo.load(
             fn=refresh_videos,
             inputs=[],
             outputs=[video_list]
         )
-
         demo.launch(server_name="192.168.10.234", server_port=8887)
 
 if __name__ == "__main__":
