@@ -10,6 +10,7 @@ import copy
 import requests
 from PIL import Image
 import sys
+import magic
 
 from llava.model.builder import load_pretrained_model
 from llava.mm_utils import get_model_name_from_path, tokenizer_image_token
@@ -67,6 +68,11 @@ def upload_video(user_file, custom_filename):
     if ext.lower() != ".mp4":
         raise gr.Error("Only .mp4 files are allowed!")
     try:
+        mime = magic.Magic(mime=True)
+        file_mime_type = mime.from_file(user_file.name)
+        if not file_mime_type.startswith("video/"):
+            raise gr.Error("Uploaded file is not a valid video file based on its MIME type!")
+
         if not custom_filename.strip():
             custom_filename = os.path.basename(user_file.name)
         if not custom_filename.lower().endswith(".mp4"):
@@ -108,23 +114,35 @@ def show_video(selected_filename):
 def process_video(server_video_name, user_input, max_tokens, temperature, top_p, top_k, chat_history):
     if not server_video_name:
         raise gr.Error("No video selected.")
+    
+    new_pair = [f"<b>User:</b>\n {user_input}", ""]
+    updated_history = chat_history + [new_pair]
+    yield updated_history, updated_history
+
     video_path = os.path.join(SERVER_VIDEOS_DIR, server_video_name)
     if not os.path.exists(video_path):
         raise gr.Error(f"File not found: {video_path}")
+
     max_frames_num = 1
     video_frames, frame_time, video_time = load_video(video_path, max_frames_num, 1, force_sample=True)
     video_tensor = image_processor.preprocess(video_frames, return_tensors="pt")["pixel_values"]
     video_tensor = video_tensor.to(device, dtype=torch.bfloat16)
     video = [video_tensor]
+
     conv_template = "qwen_2"
-    time_instruciton = f"The video lasts for {video_time:.2f} seconds, and {len(video[0])} frames are uniformly sampled from it. These frames are located at {frame_time}. Please answer the following questions related to this video."
-    question = DEFAULT_IMAGE_TOKEN + f"\n{time_instruciton}\n{user_input}"
+    time_instruction = (
+        f"The video lasts for {video_time:.2f} seconds, and {len(video[0])} frames are uniformly sampled from it. "
+        f"These frames are located at {frame_time}. Please answer the following questions related to this video."
+    )
+    question = DEFAULT_IMAGE_TOKEN + f"\n{time_instruction}\n{user_input}"
+    
     conv = copy.deepcopy(conv_templates[conv_template])
     conv.append_message(conv.roles[0], question)
     conv.append_message(conv.roles[1], None)
     prompt_question = conv.get_prompt()
     input_ids = tokenizer_image_token(prompt_question, tokenizer, IMAGE_TOKEN_INDEX, return_tensors="pt")
     input_ids = input_ids.unsqueeze(0).to(device)
+
     with torch.inference_mode():
         cont = model.generate(
             input_ids,
@@ -137,10 +155,16 @@ def process_video(server_video_name, user_input, max_tokens, temperature, top_p,
             max_new_tokens=max_tokens,
         )
     text_outputs = tokenizer.batch_decode(cont, skip_special_tokens=True)[0].strip()
-    new_pair = [f"<b>User:</b>\n {user_input}", f"<b>Assistant:</b>\n {text_outputs}"]
 
-    updated_history = chat_history + [new_pair]
-    return updated_history, updated_history
+    tokens = text_outputs.split()
+    streaming_text = ""
+    for token in tokens:
+        streaming_text += token + " "
+        new_pair[1] = f"<b>Assistant:</b>\n {streaming_text.strip()}"
+        updated_history[-1] = new_pair
+        yield updated_history, updated_history
+        time.sleep(0.1)
+
 
 def main():
     preset_questions = [
@@ -178,6 +202,13 @@ def main():
         display: flow-root !important;
         margin-bottom: 8px !important;
     }
+
+    /* CSS สำหรับให้ gr.Chatbot ขยายความสูงอัตโนมัติ */
+    .custom-chatbot .chatbox {
+        height: auto !important;
+        max-height: none !important;
+        overflow-y: visible !important;
+    }
     """
     
     with gr.Blocks(css=custom_css) as demo:
@@ -188,16 +219,16 @@ def main():
             with gr.Column():
                 gr.Markdown("### 1) Upload video")
                 uploader = gr.File(
-                    label="Choose a video from your PC",
+                    label="Choose a video from your device",
                     file_types=[".mp4"],
                     type="file", scale=0
                 )
                 filename_input = gr.Textbox(
-                    label="Enter filename (without extension)",
+                    label="Enter filename (with or without file format)",
                     placeholder="Enter desired filename",
                     interactive=True, scale=0
                 )
-                upload_btn = gr.Button("Upload to Server", scale=0)
+                upload_btn = gr.Button("Upload to Server")
                 upload_status = gr.Textbox(label="Upload Status", scale=0)
                 uploader.change(
                     fn=update_filename,
@@ -211,7 +242,7 @@ def main():
                     choices=[],
                     value=None, scale=0
                 )
-                refresh_btn = gr.Button("Refresh File List", scale=0)
+                refresh_btn = gr.Button("Refresh File List")
                 video_player = gr.Video(
                     label="Preview",
                     type="filepath", scale=0
@@ -311,9 +342,9 @@ def main():
                         inputs=[style_radio],
                         outputs=[max_tokens_slider, temperature_slider, top_p_slider, top_k_slider]
                     )
-                submit_btn = gr.Button("Generate", scale=0)
+                submit_btn = gr.Button("Generate")
         gr.Markdown("### 4) Result")
-        chat_output = gr.Chatbot(label="Model Output",)
+        chat_output = gr.Chatbot(label="Model Output",elem_classes="custom-chatbot")
         submit_btn.click(
             fn=process_video,
             inputs=[video_list, user_prompt, max_tokens_slider, temperature_slider, top_p_slider, top_k_slider, chat_history],
@@ -324,7 +355,7 @@ def main():
             inputs=[],
             outputs=[video_list]
         )
-        demo.launch(server_name="192.168.10.234", server_port=8887)
+        demo.launch(server_name="192.168.10.234", server_port=8887, enable_queue=True)
 
 if __name__ == "__main__":
     main()
